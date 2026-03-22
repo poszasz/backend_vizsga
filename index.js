@@ -57,6 +57,20 @@ function auth(req, res, next) {
     }
 }
 
+// ========== ÉRTESÍTÉS KÜLDŐ SEGÉDFÜGGVÉNY ==========
+async function sendNotification(userId, type, title, message, relatedId = null) {
+    try {
+        const sql = `
+            INSERT INTO notifications (user_id, type, title, message, related_id, created_at)
+            VALUES (?, ?, ?, ?, ?, NOW())
+        `
+        await db.query(sql, [userId, type, title, message, relatedId])
+        console.log(`Notification sent to user ${userId}: ${title}`)
+    } catch (error) {
+        console.error("Error sending notification:", error)
+    }
+}
+
 // ---------- VÉGPONTOK ----------
 
 // REGISZTRÁCIÓ
@@ -350,6 +364,21 @@ app.post('/make-offer', auth, async (req, res) => {
             return res.status(400).json({ message: "You cannot offer on your own listing" })
         }
 
+        // Kártyák adatainak lekérése az értesítéshez
+        const [listingCard] = await connection.query(
+            'SELECT c.manufacturer, c.name FROM user_cards uc JOIN cards c ON uc.card_id = c.id WHERE uc.id = ?',
+            [listing[0].user_card_id]
+        )
+        const [offeredCard] = await connection.query(
+            'SELECT c.manufacturer, c.name FROM user_cards uc JOIN cards c ON uc.card_id = c.id WHERE uc.id = ?',
+            [offeredUserCardId]
+        )
+
+        const listingManufacturer = listingCard[0].manufacturer
+        const listingName = listingCard[0].name
+        const offeredManufacturer = offeredCard[0].manufacturer
+        const offeredName = offeredCard[0].name
+
         // Ellenőrizzük, hogy a felajánlott kártyának nincs-e már aktív listingje
         const cardListingSql = 'SELECT * FROM market_listings WHERE user_card_id = ? AND status = "active"'
         const [cardListing] = await connection.query(cardListingSql, [offeredUserCardId])
@@ -371,6 +400,15 @@ app.post('/make-offer', auth, async (req, res) => {
         // Ajánlat létrehozása
         const offerSql = 'INSERT INTO market_offers (listing_id, offered_user_card_id, status, created_at) VALUES (?, ?, "pending", NOW())'
         const [result] = await connection.query(offerSql, [listingId, offeredUserCardId])
+
+        // Értesítés küldése a listing tulajdonosának
+        await sendNotification(
+            owner[0].user_id,
+            'incoming_offer',
+            'New Offer Received!',
+            `${req.user.username} offered their ${offeredManufacturer} ${offeredName} for your ${listingManufacturer} ${listingName}`,
+            result.insertId
+        )
 
         await connection.commit()
 
@@ -422,7 +460,7 @@ app.get('/my-pending-offers', auth, async (req, res) => {
     }
 })
 
-// AJÁNLAT ELFOGADÁSA
+// AJÁNLAT ELFOGADÁSA 
 app.post('/accept-offer/:offerId', auth, async (req, res) => {
     const { offerId } = req.params
 
@@ -431,12 +469,23 @@ app.post('/accept-offer/:offerId', auth, async (req, res) => {
     try {
         await connection.beginTransaction()
 
-        // Ajánlat lekérése
+        // Ajánlat lekérése - JAVÍTVA: az offerer_id-t a user_cards táblából kell lekérni
         const offerSql = `
-            SELECT mo.*, ml.user_card_id as listing_card_id, uc.user_id as listing_owner_id
+            SELECT 
+                mo.*, 
+                ml.user_card_id as listing_card_id, 
+                uc.user_id as listing_owner_id,
+                uc_offer.user_id as offerer_id,
+                c_listing.manufacturer as listing_manufacturer, 
+                c_listing.name as listing_name,
+                c_offer.manufacturer as offered_manufacturer, 
+                c_offer.name as offered_name
             FROM market_offers mo
             INNER JOIN market_listings ml ON mo.listing_id = ml.id
             INNER JOIN user_cards uc ON ml.user_card_id = uc.id
+            INNER JOIN user_cards uc_offer ON mo.offered_user_card_id = uc_offer.id
+            INNER JOIN cards c_listing ON uc.card_id = c_listing.id
+            INNER JOIN cards c_offer ON uc_offer.card_id = c_offer.id
             WHERE mo.id = ? AND mo.status = "pending"
         `
         const [offer] = await connection.query(offerSql, [offerId])
@@ -455,8 +504,8 @@ app.post('/accept-offer/:offerId', auth, async (req, res) => {
         // Kártyák cseréje
         // 1. A listing kártya átmegy az ajánlattevőhöz
         await connection.query(
-            'UPDATE user_cards SET user_id = (SELECT user_id FROM market_offers WHERE id = ?) WHERE id = ?',
-            [offerId, offer[0].listing_card_id]
+            'UPDATE user_cards SET user_id = ? WHERE id = ?',
+            [offer[0].offerer_id, offer[0].listing_card_id]
         )
 
         // 2. Az ajánlott kártya átmegy a listing tulajdonosához
@@ -483,13 +532,27 @@ app.post('/accept-offer/:offerId', auth, async (req, res) => {
             [offer[0].listing_id, offerId]
         )
 
+        // Értesítés küldése az ajánlattevőnek
+        try {
+            await sendNotification(
+                offer[0].offerer_id,
+                'offer_accepted',
+                'Your Offer Was Accepted!',
+                `Your offer was accepted! You received ${offer[0].listing_manufacturer} ${offer[0].listing_name} in exchange for your ${offer[0].offered_manufacturer} ${offer[0].offered_name}`,
+                offerId
+            )
+        } catch (notifyError) {
+            console.error("Error sending notification:", notifyError)
+            // Nem dobjuk tovább a hibát
+        }
+
         await connection.commit()
 
         res.status(200).json({ message: "Offer accepted successfully" })
     } catch (error) {
         await connection.rollback()
-        console.log(error)
-        res.status(500).json({ message: "Server error!" })
+        console.error("Error in accept-offer:", error)
+        res.status(500).json({ message: "Server error: " + error.message })
     } finally {
         connection.release()
     }
@@ -500,6 +563,25 @@ app.post('/reject-offer/:offerId', auth, async (req, res) => {
     const { offerId } = req.params
 
     try {
+        // Először kérdezd le az offer adatait
+        const [offerData] = await db.query(`
+            SELECT mo.*, 
+                   c_listing.manufacturer as listing_manufacturer, c_listing.name as listing_name,
+                   c_offer.manufacturer as offered_manufacturer, c_offer.name as offered_name,
+                   mo.offerer_id
+            FROM market_offers mo
+            INNER JOIN market_listings ml ON mo.listing_id = ml.id
+            INNER JOIN user_cards uc_listing ON ml.user_card_id = uc_listing.id
+            INNER JOIN cards c_listing ON uc_listing.card_id = c_listing.id
+            INNER JOIN user_cards uc_offer ON mo.offered_user_card_id = uc_offer.id
+            INNER JOIN cards c_offer ON uc_offer.card_id = c_offer.id
+            WHERE mo.id = ? AND mo.status = 'pending'
+        `, [offerId])
+
+        if (offerData.length === 0) {
+            return res.status(404).json({ message: "Offer not found or already processed" })
+        }
+
         const sql = `
             UPDATE market_offers mo
             INNER JOIN market_listings ml ON mo.listing_id = ml.id
@@ -512,6 +594,15 @@ app.post('/reject-offer/:offerId', auth, async (req, res) => {
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: "Offer not found or already processed" })
         }
+
+        // Értesítés küldése az ajánlattevőnek
+        await sendNotification(
+            offerData[0].offerer_id,
+            'offer_rejected',
+            'Your Offer Was Rejected',
+            `Your offer for ${offerData[0].listing_manufacturer} ${offerData[0].listing_name} was rejected.`,
+            offerId
+        )
 
         res.status(200).json({ message: "Offer rejected successfully" })
     } catch (error) {
@@ -769,6 +860,62 @@ app.get('/incoming-offers', auth, async (req, res) => {
         res.status(500).json({ message: "Server error!", offers: [] })
     }
 })
+
+// ========== ÉRTESÍTÉSEK VÉGPONTOK ==========
+
+// ÉRTESÍTÉSEK LEKÉRÉSE
+// ========== ÉRTESÍTÉSEK VÉGPONTOK ==========
+
+// ÉRTESÍTÉSEK LEKÉRÉSE
+app.get('/notifications', auth, async (req, res) => {
+    try {
+        const [rows] = await db.query(
+            `SELECT id, type, title, message, related_id, is_read, created_at 
+             FROM notifications 
+             WHERE user_id = ? 
+             ORDER BY created_at DESC 
+             LIMIT 50`,
+            [req.user.id]
+        );
+        
+        res.status(200).json({
+            message: "Notifications retrieved successfully",
+            notifications: rows
+        });
+    } catch (error) {
+        console.log(error);
+        res.status(500).json({ message: "Server error!", notifications: [] });
+    }
+});
+
+// ÉRTESÍTÉS MEGJELÖLÉSE OLVASOTTKÉNT
+app.put('/notifications/:id/read', auth, async (req, res) => {
+    const { id } = req.params;
+    try {
+        await db.query(
+            'UPDATE notifications SET is_read = TRUE WHERE id = ? AND user_id = ?',
+            [id, req.user.id]
+        );
+        res.status(200).json({ message: "Notification marked as read" });
+    } catch (error) {
+        console.log(error);
+        res.status(500).json({ message: "Server error!" });
+    }
+});
+
+// ÖSSZES ÉRTESÍTÉS MEGJELÖLÉSE OLVASOTTKÉNT
+app.put('/notifications/read-all', auth, async (req, res) => {
+    try {
+        await db.query(
+            'UPDATE notifications SET is_read = TRUE WHERE user_id = ?',
+            [req.user.id]
+        );
+        res.status(200).json({ message: "All notifications marked as read" });
+    } catch (error) {
+        console.log(error);
+        res.status(500).json({ message: "Server error!" });
+    }
+});
 
 
 // SZERVER INDÍTÁSA

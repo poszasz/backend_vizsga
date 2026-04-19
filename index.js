@@ -1,34 +1,35 @@
+require('dotenv').config()
+
 const express = require('express')
 const cors = require('cors')
 const cookieparser = require('cookie-parser')
 const mysql = require('mysql2/promise')
 const jwt = require('jsonwebtoken')
 const emailValidator = require('node-email-verifier')
-const bcrypt = require('bcrypt')
+const bcrypt = require('bcryptjs')
 
 // config
-const PORT = 3000;
-const HOST = 'localhost'
-const JWT_SECRET = 'valami_jelszo'
-const JWT_EXPIRES_IN = '7d'
+const PORT = process.env.PORT;
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN;
 const COOKIE_NAME = 'auth-token'
 
 // cookie beállítás
 const COOKIE_OPTS = {
     httpOnly: true,
-    secure: false,
-    sameSite: 'lax',
+    secure: true,
+    sameSite: 'none',
     path: '/',
     maxAge: 7 * 24 * 60 * 60 * 1000,
 }
 
 // adatbázis beállítás
 const db = mysql.createPool({
-    host: 'localhost',
-    port: '3306',
-    user: 'root',
-    password: '',
-    database: 'project'
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME
 })
 
 // APP
@@ -37,10 +38,8 @@ const app = express();
 app.use(express.json())
 app.use(cookieparser())
 app.use(cors({
-    origin: 'http://localhost:5173',
+    origin: '*',
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
 }))
 
 // Middleware
@@ -79,13 +78,13 @@ app.post('/registration', async (req, res) => {
     if (!email || !username || !password) {
         return res.status(400).json({ message: "Missing data" })
     }
-    
+
     const connection = await db.getConnection()
-    
+
     try {
         await connection.beginTransaction()
-        
-        const isValid = await emailValidator(email)
+
+        const isValid = await emailValidator(email, { checkMx: false })
         if (!isValid) {
             await connection.rollback()
             return res.status(400).json({ message: "Email address is not valid." })
@@ -101,29 +100,29 @@ app.post('/registration', async (req, res) => {
         const hash = await bcrypt.hash(password, 10)
         const registrationSQL = 'INSERT INTO users (email, username, password) VALUES (?, ?, ?)'
         const [result] = await connection.query(registrationSQL, [email, username, hash])
-        
+
         const newUserId = result.insertId
-        
+
         // 10 pack hozzáadása az új felhasználónak
         const packValues = []
         for (let i = 0; i < 10; i++) {
             packValues.push([newUserId])
         }
-        
+
         await connection.query(
             'INSERT INTO user_packs (user_id) VALUES ?',
             [packValues]
         )
-        
+
         await connection.commit()
-        
+
         console.log(`New user registered: ${username} (ID: ${newUserId}) with 10 starter packs`)
-        
-        return res.status(200).json({ 
-            message: "Registration successful! You received 10 starter packs.", 
-            id: newUserId 
+
+        return res.status(200).json({
+            message: "Registration successful! You received 10 starter packs.",
+            id: newUserId
         })
-        
+
     } catch (error) {
         await connection.rollback()
         console.log(error)
@@ -141,7 +140,7 @@ app.post('/login', async (req, res) => {
     }
 
     try {
-        const isEmail = await emailValidator(usernameOrEmail)
+        const isEmail = await emailValidator(usernameOrEmail, { checkMx: false })
         let user = {}
 
         if (isEmail) {
@@ -189,13 +188,118 @@ app.post('/login', async (req, res) => {
 
 // KIJELENTKEZÉS
 app.post('/logout', auth, async (req, res) => {
-    res.clearCookie(COOKIE_NAME, { path: '/' });
+    res.clearCookie(COOKIE_NAME, { 
+        httpOnly: true,
+        secure: true,
+        sameSite: 'none',
+        path: '/' });
     res.status(200).json({ message: "Logout successful" })
 })
 
 // SAJÁT ADATOK
 app.get('/adataim', auth, async (req, res) => {
     res.status(200).json(req.user)
+})
+
+// EMAIL MÓDOSÍTÁS
+app.put('/email', auth, async (req, res) => {
+    const { newEmail } = req.body
+    if (!newEmail) {
+        return res.status(400).json({ message: "Email is required." })
+    }
+
+    const isValid = await emailValidator(newEmail)
+    if (!isValid) {
+        return res.status(400).json({ message: "Enter a valid email." })
+    }
+
+    try {
+        const sql1 = 'SELECT * FROM users WHERE email = ?'
+        const [result] = await db.query(sql1, [newEmail])
+        if (result.length) {
+            return res.status(409).json({ message: "Email is already taken." })
+        }
+
+        const sql2 = 'UPDATE users SET email = ? WHERE id = ?'
+        await db.query(sql2, [newEmail, req.user.id])
+        return res.status(200).json({ message: "Email successfully updated." })
+    } catch (error) {
+        console.log(error)
+        res.status(500).json({ message: "Server error!" })
+    }
+})
+
+// FELHASZNÁLÓNÉV MÓDOSÍTÁS
+app.put('/username', auth, async (req, res) => {
+    const { newUsername } = req.body
+    if (!newUsername) {
+        return res.status(400).json({ message: "New username is required" })
+    }
+
+    try {
+        const sql1 = 'SELECT * FROM users WHERE username = ?'
+        const [result] = await db.query(sql1, [newUsername])
+        if (result.length) {
+            return res.status(409).json({ message: "Username is already taken." })
+        }
+
+        const sql2 = 'UPDATE users SET username = ? WHERE id = ?'
+        await db.query(sql2, [newUsername, req.user.id])
+        return res.status(200).json({ message: "Username successfully updated." })
+    } catch (error) {
+        console.log(error)
+        res.status(500).json({ message: "Server error" })
+    }
+})
+
+// JELSZÓ MÓDOSÍTÁS
+app.put('/password', auth, async (req, res) => {
+    const { nowPassword, newPassword } = req.body
+    if (!nowPassword || !newPassword) {
+        return res.status(400).json({ message: "Missing data" })
+    }
+
+    try {
+        const sql = 'SELECT * FROM users WHERE id = ?'
+        const [rows] = await db.query(sql, [req.user.id])
+        const user = rows[0];
+        const hashPassword = user.password;
+
+        const passwordMatch = await bcrypt.compare(nowPassword, hashPassword)
+        if (!passwordMatch) {
+            return res.status(401).json({ message: "Incorrect password." })
+        }
+
+        const newHash = await bcrypt.hash(newPassword, 10);
+        const sql2 = 'UPDATE users SET password = ? WHERE id = ?'
+        await db.query(sql2, [newHash, req.user.id])
+        res.status(200).json({ message: "New password set successfully." })
+    } catch (error) {
+        console.log(error)
+        res.status(500).json({ message: "Server error" })
+    }
+})
+
+// FELHASZNÁLÓ TÖRLÉSE
+app.delete('/account', auth, async (req, res) => {
+    try {
+        // Először töröljük a kapcsolódó adatokat (opcionális, ha van FOREIGN KEY CASCADE)
+        await db.query('DELETE FROM notifications WHERE user_id = ?', [req.user.id])
+        await db.query('DELETE FROM market_offers WHERE listing_id IN (SELECT id FROM market_listings WHERE user_card_id IN (SELECT id FROM user_cards WHERE user_id = ?))', [req.user.id])
+        await db.query('DELETE FROM market_listings WHERE user_card_id IN (SELECT id FROM user_cards WHERE user_id = ?)', [req.user.id])
+        await db.query('DELETE FROM user_cards WHERE user_id = ?', [req.user.id])
+        await db.query('DELETE FROM user_packs WHERE user_id = ?', [req.user.id])
+        
+        // Végül töröljük a felhasználót
+        const sql = 'DELETE FROM users WHERE id = ?'
+        await db.query(sql, [req.user.id])
+        
+        res.clearCookie(COOKIE_NAME, { path: '/' })
+        res.status(200).json({ message: "Account successfully deleted" })
+    } catch (error) {
+        console.log(error)
+        res.status(500).json({ message: "Server error" })
+    }
 })
 
 // SAJÁT KÁRTYÁK LEKÉRÉSE 
@@ -217,7 +321,7 @@ app.get('/my-cards', auth, async (req, res) => {
             ORDER BY c.manufacturer, c.name
         `
         const [rows] = await db.query(sql, [req.user.id])
-        
+
         console.log("Backend /my-cards válasz:", rows)
         res.status(200).json({
             message: "Cards retrieved successfully",
@@ -741,7 +845,7 @@ app.get('/my-packs', auth, async (req, res) => {
             [req.user.id]
         )
         console.log(`User ${req.user.id} has ${rows[0].pack_count} packs`)
-        return res.status(200).json({ 
+        return res.status(200).json({
             message: "Packs retrieved successfully",
             packs: rows[0].pack_count || 0
         })
@@ -754,50 +858,50 @@ app.get('/my-packs', auth, async (req, res) => {
 // PACK NYITÁS
 app.post('/open-pack', auth, async (req, res) => {
     const connection = await db.getConnection()
-    
+
     try {
         await connection.beginTransaction()
-        
+
         // 1. Ellenőrizzük, hogy van-e packja
         const [packRows] = await connection.query(
             'SELECT id FROM user_packs WHERE user_id = ? LIMIT 1',
             [req.user.id]
         )
-        
+
         if (packRows.length === 0) {
             await connection.rollback()
             return res.status(400).json({ message: "You don't have any packs to open!" })
         }
-        
+
         // 2. Válassz egy random kártyát (kivéve a teszt kártyákat 1-4)
         const [cards] = await connection.query(
             'SELECT * FROM cards WHERE id > 4 ORDER BY RAND() LIMIT 1'
         )
-        
+
         if (cards.length === 0) {
             await connection.rollback()
             return res.status(404).json({ message: "No cards available in the database" })
         }
-        
+
         const selectedCard = cards[0]
-        
+
         // 3. Add hozzá a user_cards táblához
         const [insertResult] = await connection.query(
             'INSERT INTO user_cards (user_id, card_id, acquired_at) VALUES (?, ?, NOW())',
             [req.user.id, selectedCard.id]
         )
-        
+
         // 4. Töröld a felhasznált packot
         await connection.query(
             'DELETE FROM user_packs WHERE id = ?',
             [packRows[0].id]
         )
-        
+
         await connection.commit()
-        
+
         console.log(`User ${req.user.id} opened a pack and got: ${selectedCard.manufacturer} ${selectedCard.name}`)
-        
-        res.status(200).json({ 
+
+        res.status(200).json({
             message: "Pack opened successfully!",
             card: {
                 id: selectedCard.id,
@@ -810,7 +914,7 @@ app.post('/open-pack', auth, async (req, res) => {
                 image_url: selectedCard.image_url
             }
         })
-        
+
     } catch (error) {
         await connection.rollback()
         console.error("Error in /open-pack:", error)
@@ -850,7 +954,7 @@ app.get('/incoming-offers', auth, async (req, res) => {
             ORDER BY mo.created_at DESC
         `
         const [rows] = await db.query(sql, [req.user.id])
-        
+
         res.status(200).json({
             message: "Incoming offers retrieved successfully",
             offers: rows
@@ -877,7 +981,7 @@ app.get('/notifications', auth, async (req, res) => {
              LIMIT 50`,
             [req.user.id]
         );
-        
+
         res.status(200).json({
             message: "Notifications retrieved successfully",
             notifications: rows
@@ -919,6 +1023,6 @@ app.put('/notifications/read-all', auth, async (req, res) => {
 
 
 // SZERVER INDÍTÁSA
-app.listen(PORT, HOST, () => {
-    console.log(`API fut: http://${HOST}:${PORT}/`)
+app.listen(PORT, () => {
+    console.log(`API fut: http://localhost:${PORT}/`)
 })

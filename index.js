@@ -38,7 +38,7 @@ const app = express();
 app.use(express.json())
 app.use(cookieparser())
 app.use(cors({
-    origin: ['http://localhost:5173','https://mycarcards.netlify.app'],
+    origin: ['http://localhost:5173', 'https://mycarcards.netlify.app'],
     credentials: true,
 }))
 
@@ -188,11 +188,12 @@ app.post('/login', async (req, res) => {
 
 // KIJELENTKEZÉS
 app.post('/logout', auth, async (req, res) => {
-    res.clearCookie(COOKIE_NAME, { 
+    res.clearCookie(COOKIE_NAME, {
         httpOnly: true,
         secure: true,
         sameSite: 'none',
-        path: '/' });
+        path: '/'
+    });
     res.status(200).json({ message: "Logout successful" })
 })
 
@@ -283,7 +284,7 @@ app.put('/password', auth, async (req, res) => {
 // FELHASZNÁLÓ TÖRLÉSE
 app.delete('/account', auth, async (req, res) => {
     const connection = await db.getConnection()
-    
+
     try {
         await connection.beginTransaction()
         await connection.query('DELETE FROM notifications WHERE user_id = ?', [req.user.id])
@@ -293,24 +294,24 @@ app.delete('/account', auth, async (req, res) => {
         await connection.query('DELETE FROM user_cards WHERE user_id = ?', [req.user.id])
         await connection.query('DELETE FROM user_packs WHERE user_id = ?', [req.user.id])
         const [result] = await connection.query('DELETE FROM users WHERE id = ?', [req.user.id])
-        
+
         if (result.affectedRows === 0) {
             await connection.rollback()
             return res.status(404).json({ message: "User not found" })
         }
-        
+
         await connection.commit()
-        
+
         // Cookie törlése
-        res.clearCookie(COOKIE_NAME, { 
+        res.clearCookie(COOKIE_NAME, {
             httpOnly: true,
             secure: true,
             sameSite: 'none',
-            path: '/' 
+            path: '/'
         })
-        
+
         res.status(200).json({ message: "Account successfully deleted" })
-        
+
     } catch (error) {
         await connection.rollback()
         console.error("Error deleting account:", error)
@@ -680,56 +681,71 @@ app.post('/accept-offer/:offerId', auth, async (req, res) => {
     }
 })
 
-// AJÁNLAT ELUTASÍTÁSA
+// AJÁNLAT ELUTASÍTÁSA (JAVÍTVA)
 app.post('/reject-offer/:offerId', auth, async (req, res) => {
     const { offerId } = req.params
 
+    const connection = await db.getConnection()
+
     try {
-        // Először kérdezd le az offer adatait
-        const [offerData] = await db.query(`
-            SELECT mo.*, 
-                   c_listing.manufacturer as listing_manufacturer, c_listing.name as listing_name,
-                   c_offer.manufacturer as offered_manufacturer, c_offer.name as offered_name,
-                   mo.offerer_id
+        await connection.beginTransaction()
+
+        // Ajánlat lekérése a listing tulajdonosának ellenőrzéséhez
+        const offerSql = `
+            SELECT 
+                mo.*,
+                ml.user_card_id as listing_card_id,
+                uc_listing.user_id as listing_owner_id,
+                uc_offer.user_id as offerer_id,
+                c_listing.manufacturer as listing_manufacturer,
+                c_listing.name as listing_name,
+                c_offer.manufacturer as offered_manufacturer,
+                c_offer.name as offered_name
             FROM market_offers mo
             INNER JOIN market_listings ml ON mo.listing_id = ml.id
             INNER JOIN user_cards uc_listing ON ml.user_card_id = uc_listing.id
-            INNER JOIN cards c_listing ON uc_listing.card_id = c_listing.id
             INNER JOIN user_cards uc_offer ON mo.offered_user_card_id = uc_offer.id
+            INNER JOIN cards c_listing ON uc_listing.card_id = c_listing.id
             INNER JOIN cards c_offer ON uc_offer.card_id = c_offer.id
             WHERE mo.id = ? AND mo.status = 'pending'
-        `, [offerId])
-
-        if (offerData.length === 0) {
-            return res.status(404).json({ message: "Offer not found or already processed" })
-        }
-
-        const sql = `
-            UPDATE market_offers mo
-            INNER JOIN market_listings ml ON mo.listing_id = ml.id
-            INNER JOIN user_cards uc ON ml.user_card_id = uc.id
-            SET mo.status = 'rejected'
-            WHERE mo.id = ? AND uc.user_id = ? AND mo.status = 'pending'
         `
-        const [result] = await db.query(sql, [offerId, req.user.id])
+        const [offer] = await connection.query(offerSql, [offerId])
 
-        if (result.affectedRows === 0) {
+        if (offer.length === 0) {
+            await connection.rollback()
             return res.status(404).json({ message: "Offer not found or already processed" })
         }
+
+        // Ellenőrizzük, hogy a bejelentkezett felhasználó a listing tulajdonosa-e
+        if (offer[0].listing_owner_id !== req.user.id) {
+            await connection.rollback()
+            return res.status(403).json({ message: "You are not the owner of this listing" })
+        }
+
+        // Ajánlat státuszának frissítése rejected-re
+        await connection.query(
+            'UPDATE market_offers SET status = "rejected" WHERE id = ?',
+            [offerId]
+        )
 
         // Értesítés küldése az ajánlattevőnek
         await sendNotification(
-            offerData[0].offerer_id,
+            offer[0].offerer_id,
             'offer_rejected',
             'Your Offer Was Rejected',
-            `Your offer for ${offerData[0].listing_manufacturer} ${offerData[0].listing_name} was rejected.`,
+            `Your offer for ${offer[0].listing_manufacturer} ${offer[0].listing_name} was rejected.`,
             offerId
         )
 
+        await connection.commit()
+
         res.status(200).json({ message: "Offer rejected successfully" })
     } catch (error) {
-        console.log(error)
-        res.status(500).json({ message: "Server error!" })
+        await connection.rollback()
+        console.error("Error in reject-offer:", error)
+        res.status(500).json({ message: "Server error: " + error.message })
+    } finally {
+        connection.release()
     }
 })
 

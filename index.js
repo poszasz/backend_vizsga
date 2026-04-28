@@ -38,7 +38,7 @@ const app = express();
 app.use(express.json())
 app.use(cookieparser())
 app.use(cors({
-    origin: '*',
+    origin: ['http://localhost:5173','https://mycarcards.netlify.app'],
     credentials: true,
 }))
 
@@ -282,23 +282,41 @@ app.put('/password', auth, async (req, res) => {
 
 // FELHASZNÁLÓ TÖRLÉSE
 app.delete('/account', auth, async (req, res) => {
+    const connection = await db.getConnection()
+    
     try {
-        // Először töröljük a kapcsolódó adatokat (opcionális, ha van FOREIGN KEY CASCADE)
-        await db.query('DELETE FROM notifications WHERE user_id = ?', [req.user.id])
-        await db.query('DELETE FROM market_offers WHERE listing_id IN (SELECT id FROM market_listings WHERE user_card_id IN (SELECT id FROM user_cards WHERE user_id = ?))', [req.user.id])
-        await db.query('DELETE FROM market_listings WHERE user_card_id IN (SELECT id FROM user_cards WHERE user_id = ?)', [req.user.id])
-        await db.query('DELETE FROM user_cards WHERE user_id = ?', [req.user.id])
-        await db.query('DELETE FROM user_packs WHERE user_id = ?', [req.user.id])
+        await connection.beginTransaction()
+        await connection.query('DELETE FROM notifications WHERE user_id = ?', [req.user.id])
+        await connection.query('DELETE FROM market_offers WHERE offered_user_card_id IN (SELECT id FROM user_cards WHERE user_id = ?)', [req.user.id])
+        await connection.query('DELETE FROM market_offers WHERE listing_id IN (SELECT id FROM market_listings WHERE user_card_id IN (SELECT id FROM user_cards WHERE user_id = ?))', [req.user.id])
+        await connection.query('DELETE FROM market_listings WHERE user_card_id IN (SELECT id FROM user_cards WHERE user_id = ?)', [req.user.id])
+        await connection.query('DELETE FROM user_cards WHERE user_id = ?', [req.user.id])
+        await connection.query('DELETE FROM user_packs WHERE user_id = ?', [req.user.id])
+        const [result] = await connection.query('DELETE FROM users WHERE id = ?', [req.user.id])
         
-        // Végül töröljük a felhasználót
-        const sql = 'DELETE FROM users WHERE id = ?'
-        await db.query(sql, [req.user.id])
+        if (result.affectedRows === 0) {
+            await connection.rollback()
+            return res.status(404).json({ message: "User not found" })
+        }
         
-        res.clearCookie(COOKIE_NAME, { path: '/' })
+        await connection.commit()
+        
+        // Cookie törlése
+        res.clearCookie(COOKIE_NAME, { 
+            httpOnly: true,
+            secure: true,
+            sameSite: 'none',
+            path: '/' 
+        })
+        
         res.status(200).json({ message: "Account successfully deleted" })
+        
     } catch (error) {
-        console.log(error)
-        res.status(500).json({ message: "Server error" })
+        await connection.rollback()
+        console.error("Error deleting account:", error)
+        res.status(500).json({ message: "Server error: " + error.message })
+    } finally {
+        connection.release()
     }
 })
 
